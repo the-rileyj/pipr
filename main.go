@@ -77,7 +77,13 @@ func pushNewRequirementsToGit(username, password, updateMessage, requirementsPat
 		return err
 	}
 
-	workTree.Add(requirementsPath)
+	absRequirementsPath, err := filepath.Abs(requirementsPath)
+
+	if err != nil {
+		return err
+	}
+
+	workTree.Add(absRequirementsPath)
 
 	workTree.Commit(updateMessage, &git.CommitOptions{
 		Author: &object.Signature{
@@ -97,7 +103,7 @@ func pushNewRequirementsToGit(username, password, updateMessage, requirementsPat
 	return err
 }
 
-func handleWatchAndNotifyRequirements(requirementsPath string) error {
+func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.Duration) error {
 	// Clean the path to maintain a uniform format for later comparison
 	requirementsPath = filepath.Clean(requirementsPath)
 
@@ -122,7 +128,7 @@ func handleWatchAndNotifyRequirements(requirementsPath string) error {
 			// This resets to waiting for two minutes each iteration
 			// of the loop, thus we don't need to worry about adding
 			// onto the time to wait after each new notification
-			case <-time.After(time.Second * 6):
+			case <-time.After(waitPeriod):
 				handlingLock.Lock()
 
 				select {
@@ -308,8 +314,6 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string) str
 		}
 	}
 
-	fmt.Println(addedRequirements, changedRequirements, removedRequirments)
-
 	if len(addedRequirements) != 0 || len(changedRequirements) != 0 || len(removedRequirments) != 0 {
 		addedRequirementsString, changedRequirementsString, removedRequirmentsString := "", "", ""
 
@@ -348,9 +352,10 @@ func main() {
 		}
 	}
 
-	handleRequirements := flag.Bool("hr", false, "Handle when a requests file changes; cannot be used in conjuction with anything other than '-rp'")
-	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the requirements file that should be watched or updated")
+	handleRequirements := flag.Bool("hr", false, "Handle when a requests file changes; cannot be used in conjuction with anything other than '-cp', -rp', and '-w'")
+	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the json config file with the github credentials that should be used")
 	requirementsPath := flag.String("rp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_REQUIREMENTS"))), "The path to the requirements file that should be watched or updated")
+	requirementsWaitPeriod := flag.Duration("w", 2*time.Minute, "How long pipr should wait after each change to the requirements.txt file before pushing the changes to github")
 
 	flag.Parse()
 
@@ -413,7 +418,7 @@ func main() {
 			}
 		}
 
-		err = handleWatchAndNotifyRequirements(*requirementsPath)
+		err = handleWatchAndNotifyRequirements(*requirementsPath, *requirementsWaitPeriod)
 
 		if err != nil {
 			panic(err)
