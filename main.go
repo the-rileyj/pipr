@@ -338,16 +338,19 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string) str
 
 func main() {
 	// Handles finding the correct path to the requirements file
-	getRequirementsPath := func(requirementsEnv string, exists bool) string {
-		if exists {
-			return requirementsEnv
-		}
+	resolvePath := func(defaultPath string) func(string, bool) string {
+		return func(requirementsEnv string, exists bool) string {
+			if exists {
+				return requirementsEnv
+			}
 
-		return "./requirements.txt"
+			return defaultPath
+		}
 	}
 
 	handleRequirements := flag.Bool("hr", false, "Handle when a requests file changes; cannot be used in conjuction with anything other than '-rp'")
-	requirementsPath := flag.String("rp", filepath.Clean(getRequirementsPath(os.LookupEnv("REQUIREMENTS"))), "The path to the requirements file that should be watched or updated")
+	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the requirements file that should be watched or updated")
+	requirementsPath := flag.String("rp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_REQUIREMENTS"))), "The path to the requirements file that should be watched or updated")
 
 	flag.Parse()
 
@@ -358,7 +361,7 @@ func main() {
 	}
 
 	if *handleRequirements {
-		if _, err = os.Stat("./config.json"); os.IsNotExist(err) {
+		if _, err = os.Stat(*configPath); os.IsNotExist(err) {
 			requirementsChangeHandler = func() error {
 				return nil
 			}
