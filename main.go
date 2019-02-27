@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +26,22 @@ var (
 	requirementsChangeHandler func() error
 )
 
+type Config struct {
+	Username string                    `json:"username"`
+	Password string                    `json:"password"`
+	Parsers  map[string]DependencyFile `json:"parsers"`
+}
+
+type DependencyFile struct {
+	Command   Command `json:"command"`
+	LineMatch string  `json:"line-match"`
+}
+
+type Command struct {
+	Name        string `json:"name"`
+	UpdateMatch string `json:"update-match"`
+}
+
 type requirementChangeMetadata struct {
 	new                          bool
 	name, newVersion, oldVersion string
@@ -34,7 +52,7 @@ type notifier struct {
 	path string
 }
 
-func (n *notifier) attachNewFileFileNotifier() error {
+func (n *notifier) attachNewNotifier() error {
 	requirementWatcher, err := fsnotify.NewWatcher()
 
 	if err != nil {
@@ -53,18 +71,18 @@ func (n *notifier) attachNewFileFileNotifier() error {
 }
 
 func newNotifier(path string) (*notifier, error) {
-	fileNotifier := &notifier{path: path}
+	newNotifier := &notifier{path: path}
 
-	err := fileNotifier.attachNewFileFileNotifier()
+	err := newNotifier.attachNewNotifier()
 
 	if err != nil {
 		return nil, err
 	}
 
-	return fileNotifier, nil
+	return newNotifier, nil
 }
 
-func pushNewRequirementsToGit(username, password, updateMessage, requirementsPath string) error {
+func pushNewRequirementsToGit(username, password, updateMessage, filePath string) error {
 	repository, err := git.PlainOpen("./")
 
 	if err != nil {
@@ -77,7 +95,7 @@ func pushNewRequirementsToGit(username, password, updateMessage, requirementsPat
 		return err
 	}
 
-	absRequirementsPath, err := filepath.Abs(requirementsPath)
+	absRequirementsPath, err := filepath.Abs(filePath)
 
 	if err != nil {
 		return err
@@ -103,11 +121,11 @@ func pushNewRequirementsToGit(username, password, updateMessage, requirementsPat
 	return err
 }
 
-func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.Duration) error {
+func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.Duration, fileChecker func(string) bool, changeHandler func(string) error) error {
 	// Clean the path to maintain a uniform format for later comparison
-	requirementsPath = filepath.Clean(requirementsPath)
+	dependenciesPath = filepath.Clean(dependenciesPath)
 
-	requirementsNotifier, err := newNotifier(requirementsPath)
+	dependenciesNotifier, err := newNotifier(dependenciesPath)
 
 	if err != nil {
 		panic(err)
@@ -157,7 +175,7 @@ func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.D
 					if err != nil {
 						// Reuse the existing error channel on the
 						// watcher for sending errors
-						requirementsNotifier.Errors <- err
+						dependenciesNotifier.Errors <- err
 					}
 
 					return
@@ -168,8 +186,8 @@ func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.D
 
 	for {
 		select {
-		case event := <-requirementsNotifier.Watcher.Events:
-			if event.Op == fsnotify.Write && filepath.Clean(event.Name) == requirementsPath {
+		case event := <-dependenciesNotifier.Watcher.Events:
+			if event.Op == fsnotify.Write && filepath.Clean(event.Name) == dependenciesPath {
 				handlingLock.Lock()
 
 				// Only check and set waitingForNewNotifications
@@ -191,9 +209,9 @@ func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.D
 
 				handlingLock.Unlock()
 			}
-		case err, ok := <-requirementsNotifier.Watcher.Errors:
+		case err, ok := <-dependenciesNotifier.Watcher.Errors:
 			if !ok {
-				requirementsNotifier.attachNewFileFileNotifier()
+				dependenciesNotifier.attachNewNotifier()
 			} else if err != nil {
 				fmt.Fprintln(os.Stdout, "Error Occured: ", err)
 			}
@@ -201,7 +219,7 @@ func handleWatchAndNotifyRequirements(requirementsPath string, waitPeriod time.D
 	}
 }
 
-func getRequirementsListFromReader(requirementsReader io.Reader) ([]string, error) {
+func getDependenciesListFromReader(requirementsReader io.Reader) ([]string, error) {
 	requirementsLines := []string{}
 	lineScanner := bufio.NewScanner(requirementsReader)
 
@@ -212,8 +230,8 @@ func getRequirementsListFromReader(requirementsReader io.Reader) ([]string, erro
 	return requirementsLines, lineScanner.Err()
 }
 
-func getRequirementsListFromPath(requirementsPath string) ([]string, error) {
-	requirementsFile, err := os.Open(requirementsPath)
+func getDependenciesListFromPath(packagesPath string) ([]string, error) {
+	requirementsFile, err := os.Open(packagesPath)
 
 	if err != nil {
 		return nil, err
@@ -221,7 +239,7 @@ func getRequirementsListFromPath(requirementsPath string) ([]string, error) {
 
 	defer requirementsFile.Close()
 
-	return getRequirementsListFromReader(requirementsFile)
+	return getDependenciesListFromReader(requirementsFile)
 }
 
 func requirementsChanged(newRequirements, oldRequirements []string) bool {
@@ -262,14 +280,61 @@ func requirementsChanged(newRequirements, oldRequirements []string) bool {
 	return false
 }
 
-func getRequirementsChangeMessage(newRequirements, oldRequirements []string) string {
+func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []string) string {
+	oldDependenciesMap, newDependenciesMap := make(map[string]bool), make(map[string]bool)
+	addedDependencies, removedDependencies := []string{}, []string{}
+
+	for _, dependency := range oldDependencies {
+		oldDependenciesMap[dependency] = true
+	}
+
+	for _, dependency := range newDependencies {
+		if !oldDependenciesMap[dependency] {
+			addedDependencies = append(addedDependencies, dependency)
+		}
+
+		newDependenciesMap[dependency] = true
+	}
+
+	for _, dependency := range oldDependencies {
+		if !newDependenciesMap[dependency] {
+			removedDependencies = append(removedDependencies, dependency)
+		}
+	}
+
+	if len(addedDependencies) != 0 || len(removedDependencies) != 0 {
+		addedRequirementsString, removedRequirmentsString := "", ""
+
+		if len(addedDependencies) != 0 {
+			addedRequirementsString = fmt.Sprintf(" Added %s.", strings.Join(addedDependencies, ", "))
+		}
+
+		if len(removedDependencies) != 0 {
+			removedRequirmentsString = fmt.Sprintf(" Removed %s.", strings.Join(removedDependencies, ", "))
+		}
+
+		return fmt.Sprintf(
+			"Changed requirements.txt:%s%s",
+			addedRequirementsString,
+			removedRequirmentsString,
+		)
+	}
+
+	return ""
+}
+
+func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nameVersionMatch string) string {
 	name, version := "", ""
 	changedRequirements, addedRequirements, removedRequirments := []string{}, []string{}, []string{}
 	requirementSplit := []string{}
 	newRequirementsMap, oldRequirementsMap := make(map[string]string), make(map[string]string)
 
+	nameVersionMatcher := regexp.MustCompile(nameVersionMatch)
+
 	for _, oldRequirement := range oldRequirements {
-		requirementSplit = strings.Split(oldRequirement, "==")
+		requirementSplit = nameVersionMatcher.FindAllString(oldRequirement, 2)
+
+		// requirementSplit = strings.Split(oldRequirement, "==")
 
 		if len(requirementSplit) != 2 {
 			continue
@@ -281,7 +346,8 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string) str
 	}
 
 	for _, newRequirement := range newRequirements {
-		requirementSplit = strings.Split(newRequirement, "==")
+		// requirementSplit = strings.Split(newRequirement, "==")
+		requirementSplit = nameVersionMatcher.FindAllString(newRequirement, 2)
 
 		if len(requirementSplit) != 2 {
 			continue
@@ -340,6 +406,14 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string) str
 	return ""
 }
 
+func handleAptWrapping() {
+
+}
+
+func handlePipWrapping() {
+
+}
+
 func main() {
 	// Handles finding the correct path to the requirements file
 	resolvePath := func(defaultPath string) func(string, bool) string {
@@ -352,73 +426,98 @@ func main() {
 		}
 	}
 
-	handleRequirements := flag.Bool("hr", false, "Handle when a requests file changes; cannot be used in conjuction with anything other than '-cp', -rp', and '-w'")
+	handleRequirements := flag.Bool("hr", false, "Handle when a dependency file changes; cannot be used in conjuction with anything other than '-cp', -rp', and '-w'")
 	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the json config file with the github credentials that should be used")
 	requirementsPath := flag.String("rp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_REQUIREMENTS"))), "The path to the requirements file that should be watched or updated")
 	requirementsWaitPeriod := flag.Duration("w", 2*time.Minute, "How long pipr should wait after each change to the requirements.txt file before pushing the changes to github")
 
 	flag.Parse()
 
-	oldRequirements, err := getRequirementsListFromPath(*requirementsPath)
+	if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+		panic(errors.New("need a config to work from for updating and syncing dependency files"))
+	}
+
+	config := Config{}
+
+	configFile, err := os.Open(*configPath)
+
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.NewDecoder(configFile).Decode(&config)
+
+	credentialsFile.Close()
+
+	if err != nil {
+		panic(err)
+	}
+
+	oldRequirements, err := getDependenciesListFromPath(*requirementsPath)
 
 	if err != nil {
 		panic(err)
 	}
 
 	if *handleRequirements {
-		if _, err = os.Stat(*configPath); os.IsNotExist(err) {
-			requirementsChangeHandler = func() error {
-				return nil
-			}
+		credentials := Config{}
 
-			fmt.Println("No config found, using dummy handler")
-		} else {
-			credentials := struct {
-				Username string `json:"username"`
-				Password string `json:"password"`
-			}{}
+		credentialsFile, err := os.Open("./config.json")
 
-			credentialsFile, err := os.Open("./config.json")
+		if err != nil {
+			panic(err)
+		}
+
+		err = json.NewDecoder(credentialsFile).Decode(&credentials)
+
+		credentialsFile.Close()
+
+		if err != nil {
+			panic(err)
+		}
+
+		oldRequirements := make(map[string][]string)
+
+		for dependencyFile, _ := range config.Parsers {
+			oldRequirements[dependencyFile], err = getDependenciesListFromPath(filepath.Join(*requirementsPath, dependencyFile))
 
 			if err != nil {
 				panic(err)
-			}
-
-			err = json.NewDecoder(credentialsFile).Decode(&credentials)
-
-			credentialsFile.Close()
-
-			if err != nil {
-				panic(err)
-			}
-
-			requirementsChangeHandler = func() error {
-				newRequirements, err := getRequirementsListFromPath(*requirementsPath)
-
-				if err != nil {
-					return err
-				}
-
-				commitMessage := getRequirementsChangeMessage(newRequirements, oldRequirements)
-
-				if commitMessage != "" {
-					fmt.Println(commitMessage)
-
-					oldRequirements = append([]string{}, newRequirements...)
-
-					return pushNewRequirementsToGit(
-						credentials.Username,
-						credentials.Password,
-						commitMessage,
-						*requirementsPath,
-					)
-				}
-
-				return nil
 			}
 		}
 
-		err = handleWatchAndNotifyRequirements(*requirementsPath, *requirementsWaitPeriod)
+		fileChecker := func(filePath string) bool {
+			_, exists := config.Parsers[filepath.Base(filePath)]
+
+			return exists
+		}
+
+		dependencyChangeHandler := func(filePath string) error {
+			newDependencies, err := getDependenciesListFromPath(filePath)
+
+			if err != nil {
+				return err
+			}
+
+			commitMessage := getRequirementsChangeMessage(newRequirements, oldRequirements)
+
+			if commitMessage != "" {
+				fmt.Println(commitMessage)
+
+				oldRequirements = append([]string{}, newRequirements...)
+
+				return pushNewRequirementsToGit(
+					credentials.Username,
+					credentials.Password,
+					commitMessage,
+					*requirementsPath,
+				)
+			}
+
+			return nil
+		}
+
+		err = handleWatchAndNotifyRequirements(*requirementsPath, *requirementsWaitPeriod, fileChecker, dependencyChangeHandler)
 
 		if err != nil {
 			panic(err)
@@ -472,7 +571,7 @@ func main() {
 				panic(err)
 			}
 
-			newRequirements, err = getRequirementsListFromReader(buf)
+			newRequirements, err = getDependenciesListFromReader(buf)
 
 			if err != nil {
 				panic(err)
