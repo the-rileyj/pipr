@@ -27,25 +27,39 @@ var (
 )
 
 type Config struct {
-	Username string                    `json:"username"`
-	Password string                    `json:"password"`
-	Parsers  map[string]DependencyFile `json:"parsers"`
+	Username     string        `json:"username"`
+	Password     string        `json:"password"`
+	Dependencies []*Dependency `json:"dependencies"`
 }
 
-type DependencyFile struct {
-	Command   Command `json:"command"`
-	LineMatch string  `json:"line-match"`
+type Dependency struct {
+	FileName           string   `json:"file-name"`
+	Command            string   `json:"command"`
+	LineMatch          string   `json:"line-match"`
+	UpdateDependencies []string `json:"update-dependencies"`
+	UpdateMatch        string   `json:"update-match"`
 }
 
-type Command struct {
-	Name        string `json:"name"`
-	UpdateMatch string `json:"update-match"`
-}
+// type Config struct {
+// 	Username string                    `json:"username"`
+// 	Password string                    `json:"password"`
+// 	Parsers  map[string]DependencyFile `json:"parsers"`
+// }
 
-type requirementChangeMetadata struct {
-	new                          bool
-	name, newVersion, oldVersion string
-}
+// type DependencyFile struct {
+// 	Command   Command `json:"command"`
+// 	LineMatch string  `json:"line-match"`
+// }
+
+// type Command struct {
+// 	Name        string `json:"name"`
+// 	UpdateMatch string `json:"update-match"`
+// }
+
+// type requirementChangeMetadata struct {
+// 	new                          bool
+// 	name, newVersion, oldVersion string
+// }
 
 type notifier struct {
 	*fsnotify.Watcher
@@ -428,7 +442,8 @@ func main() {
 
 	handleRequirements := flag.Bool("hr", false, "Handle when a dependency file changes; cannot be used in conjuction with anything other than '-cp', -rp', and '-w'")
 	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the json config file with the github credentials that should be used")
-	requirementsPath := flag.String("rp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_REQUIREMENTS"))), "The path to the requirements file that should be watched or updated")
+	// NEED TO CHANGE PIPR_REQUIREMENTS to PIPR_DEPENDENCIES, and rp to dp
+	requirementsPath := flag.String("dp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_DEPENDENCIES"))), "The path to the dependencies directory that should be watched or updated")
 	requirementsWaitPeriod := flag.Duration("w", 2*time.Minute, "How long pipr should wait after each change to the requirements.txt file before pushing the changes to github")
 
 	flag.Parse()
@@ -447,47 +462,30 @@ func main() {
 
 	err = json.NewDecoder(configFile).Decode(&config)
 
-	credentialsFile.Close()
+	configFile.Close()
 
 	if err != nil {
 		panic(err)
 	}
 
-	oldRequirements, err := getDependenciesListFromPath(*requirementsPath)
+	commandToDependenciesMap := make(map[string]*Dependency)
+	fileToDependenciesMap := make(map[string]*Dependency)
+	oldDependenciesMap := make(map[string][]string)
 
-	if err != nil {
-		panic(err)
+	for _, dependency := range config.Dependencies {
+		oldDependenciesMap[dependency.FileName], err = getDependenciesListFromPath(filepath.Join(*requirementsPath, dependency.FileName))
+
+		if err != nil {
+			panic(fmt.Errorf("failed to get existing dependencies for %s file", dependency.FileName))
+		}
+
+		commandToDependenciesMap[dependency.Command] = dependency
+		fileToDependenciesMap[dependency.FileName] = dependency
 	}
 
 	if *handleRequirements {
-		credentials := Config{}
-
-		credentialsFile, err := os.Open("./config.json")
-
-		if err != nil {
-			panic(err)
-		}
-
-		err = json.NewDecoder(credentialsFile).Decode(&credentials)
-
-		credentialsFile.Close()
-
-		if err != nil {
-			panic(err)
-		}
-
-		oldRequirements := make(map[string][]string)
-
-		for dependencyFile, _ := range config.Parsers {
-			oldRequirements[dependencyFile], err = getDependenciesListFromPath(filepath.Join(*requirementsPath, dependencyFile))
-
-			if err != nil {
-				panic(err)
-			}
-		}
-
 		fileChecker := func(filePath string) bool {
-			_, exists := config.Parsers[filepath.Base(filePath)]
+			_, exists := oldDependenciesMap[filepath.Base(filePath)]
 
 			return exists
 		}
@@ -499,18 +497,22 @@ func main() {
 				return err
 			}
 
-			commitMessage := getRequirementsChangeMessage(newRequirements, oldRequirements)
+			commitMessage := getRequirementsChangeMessage(
+				newDependencies,
+				oldDependenciesMap[filepath.Base(filePath)],
+				fileToDependenciesMap[filepath.Base(filePath)].LineMatch,
+			)
 
 			if commitMessage != "" {
 				fmt.Println(commitMessage)
 
-				oldRequirements = append([]string{}, newRequirements...)
+				oldDependenciesMap[filepath.Base(filePath)] = newDependencies
 
 				return pushNewRequirementsToGit(
-					credentials.Username,
-					credentials.Password,
+					config.Username,
+					config.Password,
 					commitMessage,
-					*requirementsPath,
+					filepath.Join(*requirementsPath, fileToDependenciesMap[filepath.Base(filePath)].FileName),
 				)
 			}
 
@@ -532,9 +534,9 @@ func main() {
 
 		args := []string{}
 
-		// Filter out the requirements path arg and the path itself
+		// Filter out the dependecies directory path arg and the path itself
 		for index := 1; index < len(os.Args); index++ {
-			if os.Args[index] == "-rp" {
+			if os.Args[index] == "-dp" {
 				index++
 			} else {
 				args = append(args, os.Args[index])
@@ -542,16 +544,25 @@ func main() {
 		}
 
 		// Handles cases where no args are provided, we would get an out of bounds
-		// error when checking for the install subcommand without adding this -h
-		// (which is the default for pip anyways)
+		// error when checking for the install subcommand without adding this
 		if len(args) == 0 {
-			args = append(args, "-h")
+			panic(errors.New("no command provided, need a command to execute correctly"))
 		}
 
-		// Handles checking for "install" and "uninstall"
-		update := strings.Contains(args[0], "install")
+		dependency, exists := commandToDependenciesMap[args[0]]
 
-		cmd := exec.Command("pip", args...)
+		if !exists {
+			panic(errors.New("command provided does not exist in the config, need a command which exists in the config to execute correctly"))
+		}
+
+		command := args[0]
+
+		args = append([]string{}, args[1:]...)
+
+		// Handles checking for subcommands which would change dependency files
+		update := strings.Contains(command, "install")
+
+		cmd := exec.Command(command, args...)
 
 		cmd.Stderr, cmd.Stdin, cmd.Stdout = os.Stderr, os.Stdin, os.Stdout
 
@@ -559,9 +570,9 @@ func main() {
 
 		if update {
 			buf := &bytes.Buffer{}
-			newRequirements := []string{}
+			newDependencies := []string{}
 
-			cmd = exec.Command("pip", "freeze")
+			cmd = exec.Command(command, dependency.UpdateDependencies...)
 
 			cmd.Stdout = buf
 
@@ -571,23 +582,23 @@ func main() {
 				panic(err)
 			}
 
-			newRequirements, err = getDependenciesListFromReader(buf)
+			newDependencies, err = getDependenciesListFromReader(buf)
 
 			if err != nil {
 				panic(err)
 			}
 
-			requirementsFile, err := os.OpenFile(*requirementsPath, os.O_WRONLY, 0444)
+			dependencyFile, err := os.OpenFile(filepath.Join(*requirementsPath, dependency.FileName), os.O_WRONLY, 0444)
 
 			if err != nil {
 				panic(err)
 			}
 
-			defer requirementsFile.Close()
+			defer dependencyFile.Close()
 
-			if requirementsChanged(newRequirements, oldRequirements) {
-				for _, newRequirement := range newRequirements {
-					fmt.Fprintln(requirementsFile, newRequirement)
+			if requirementsChanged(newDependencies, oldDependenciesMap[dependency.FileName]) {
+				for _, newDependency := range newDependencies {
+					fmt.Fprintln(dependencyFile, newDependency)
 				}
 			}
 		}
