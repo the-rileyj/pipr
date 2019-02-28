@@ -38,6 +38,7 @@ type Dependency struct {
 	LineMatch          string   `json:"line-match"`
 	UpdateDependencies []string `json:"update-dependencies"`
 	UpdateMatch        string   `json:"update-match"`
+	Versioned          bool     `json:"versioned"`
 }
 
 // type Config struct {
@@ -172,7 +173,8 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 
 					continue
 				default:
-					err := requirementsChangeHandler()
+					// NEED TO HANDLE MULTIPLE AND GET THE FILEPATH HERE SOMEHOW
+					err := changeHandler()
 
 					// Indicate that we are no longer listening
 					// for new notifications
@@ -201,7 +203,7 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 	for {
 		select {
 		case event := <-dependenciesNotifier.Watcher.Events:
-			if event.Op == fsnotify.Write && filepath.Clean(event.Name) == dependenciesPath {
+			if event.Op == fsnotify.Write && fileChecker(event.Name) {
 				handlingLock.Lock()
 
 				// Only check and set waitingForNewNotifications
@@ -256,37 +258,19 @@ func getDependenciesListFromPath(packagesPath string) ([]string, error) {
 	return getDependenciesListFromReader(requirementsFile)
 }
 
-func requirementsChanged(newRequirements, oldRequirements []string) bool {
-	if len(newRequirements) != len(oldRequirements) {
+func dependenciesChanged(newDependencies, oldDependencies []string) bool {
+	if len(newDependencies) != len(oldDependencies) {
 		return true
 	}
 
-	name, version := "", ""
-	requirementSplit := []string{}
-	oldRequirementsMap := make(map[string]string)
+	oldRequirementsMap := make(map[string]bool)
 
-	for _, oldRequirement := range oldRequirements {
-		requirementSplit = strings.Split(oldRequirement, "==")
-
-		if len(requirementSplit) != 2 {
-			continue
-		}
-
-		name, version = requirementSplit[0], requirementSplit[1]
-
-		oldRequirementsMap[name] = version
+	for _, oldRequirement := range oldDependencies {
+		oldRequirementsMap[oldRequirement] = true
 	}
 
-	for _, newRequirement := range newRequirements {
-		requirementSplit = strings.Split(newRequirement, "==")
-
-		if len(requirementSplit) != 2 {
-			continue
-		}
-
-		name, version = requirementSplit[0], requirementSplit[1]
-
-		if oldVersion, exists := oldRequirementsMap[name]; !exists || oldVersion != version {
+	for _, newRequirement := range newDependencies {
+		if !oldRequirementsMap[newRequirement] {
 			return true
 		}
 	}
@@ -294,15 +278,34 @@ func requirementsChanged(newRequirements, oldRequirements []string) bool {
 	return false
 }
 
-func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []string) string {
+func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []string, nameMatch string) string {
 	oldDependenciesMap, newDependenciesMap := make(map[string]bool), make(map[string]bool)
 	addedDependencies, removedDependencies := []string{}, []string{}
+	name := []string{}
+
+	nameMatcher := regexp.MustCompile(nameMatch)
 
 	for _, dependency := range oldDependencies {
+		name = nameMatcher.FindAllString(dependency, 1)
+
+		if len(name) != 1 {
+			continue
+		}
+
+		dependency = name[0]
+
 		oldDependenciesMap[dependency] = true
 	}
 
 	for _, dependency := range newDependencies {
+		name = nameMatcher.FindAllString(dependency, 1)
+
+		if len(name) != 1 {
+			continue
+		}
+
+		dependency = name[0]
+
 		if !oldDependenciesMap[dependency] {
 			addedDependencies = append(addedDependencies, dependency)
 		}
@@ -328,7 +331,7 @@ func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []
 		}
 
 		return fmt.Sprintf(
-			"Changed requirements.txt:%s%s",
+			"Changed %%s:%s%s",
 			addedRequirementsString,
 			removedRequirmentsString,
 		)
@@ -337,7 +340,7 @@ func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []
 	return ""
 }
 
-func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nameVersionMatch string) string {
+func getVersionedDependenciesChangeMessage(newRequirements, oldRequirements []string, nameVersionMatch string) string {
 	name, version := "", ""
 	changedRequirements, addedRequirements, removedRequirments := []string{}, []string{}, []string{}
 	requirementSplit := []string{}
@@ -347,8 +350,6 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nam
 
 	for _, oldRequirement := range oldRequirements {
 		requirementSplit = nameVersionMatcher.FindAllString(oldRequirement, 2)
-
-		// requirementSplit = strings.Split(oldRequirement, "==")
 
 		if len(requirementSplit) != 2 {
 			continue
@@ -360,7 +361,6 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nam
 	}
 
 	for _, newRequirement := range newRequirements {
-		// requirementSplit = strings.Split(newRequirement, "==")
 		requirementSplit = nameVersionMatcher.FindAllString(newRequirement, 2)
 
 		if len(requirementSplit) != 2 {
@@ -381,7 +381,7 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nam
 	}
 
 	for _, oldRequirement := range oldRequirements {
-		requirementSplit = strings.Split(oldRequirement, "==")
+		requirementSplit = nameVersionMatcher.FindAllString(oldRequirement, 2)
 
 		if len(requirementSplit) != 2 {
 			continue
@@ -410,7 +410,7 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nam
 		}
 
 		return fmt.Sprintf(
-			"Changed requirements.txt:%s%s%s",
+			"Changed %%s:%s%s%s",
 			addedRequirementsString,
 			changedRequirementsString,
 			removedRequirmentsString,
@@ -418,14 +418,6 @@ func getRequirementsChangeMessage(newRequirements, oldRequirements []string, nam
 	}
 
 	return ""
-}
-
-func handleAptWrapping() {
-
-}
-
-func handlePipWrapping() {
-
 }
 
 func main() {
@@ -491,20 +483,33 @@ func main() {
 		}
 
 		dependencyChangeHandler := func(filePath string) error {
+			dependency := fileToDependenciesMap[filepath.Base(filePath)]
 			newDependencies, err := getDependenciesListFromPath(filePath)
 
 			if err != nil {
 				return err
 			}
 
-			commitMessage := getRequirementsChangeMessage(
-				newDependencies,
-				oldDependenciesMap[filepath.Base(filePath)],
-				fileToDependenciesMap[filepath.Base(filePath)].LineMatch,
-			)
+			var commitMessage string
+
+			if dependency.Versioned {
+				commitMessage = getVersionedDependenciesChangeMessage(
+					newDependencies,
+					oldDependenciesMap[filepath.Base(filePath)],
+					dependency.LineMatch,
+				)
+			} else {
+				commitMessage = getUnversionedDependenciesChangeMessage(
+					newDependencies,
+					oldDependenciesMap[filepath.Base(filePath)],
+					dependency.LineMatch,
+				)
+			}
 
 			if commitMessage != "" {
 				fmt.Println(commitMessage)
+
+				commitMessage = fmt.Sprintf(commitMessage, filepath.Base(filePath))
 
 				oldDependenciesMap[filepath.Base(filePath)] = newDependencies
 
@@ -512,7 +517,7 @@ func main() {
 					config.Username,
 					config.Password,
 					commitMessage,
-					filepath.Join(*requirementsPath, fileToDependenciesMap[filepath.Base(filePath)].FileName),
+					filepath.Join(*requirementsPath, dependency.FileName),
 				)
 			}
 
@@ -531,7 +536,6 @@ func main() {
 		// (ex. install, uninstall) compare the string list representing the original
 		// requirements file to the result of the "pip freeze" command to see if
 		// anything has changed
-
 		args := []string{}
 
 		// Filter out the dependecies directory path arg and the path itself
@@ -555,12 +559,22 @@ func main() {
 			panic(errors.New("command provided does not exist in the config, need a command which exists in the config to execute correctly"))
 		}
 
+		// Handles when there is no way to update the dependencies after the command executes
+		if len(dependency.UpdateDependencies) == 0 {
+			panic(errors.New("command provided does not have any way for updating it's dependencies in the config, need a way of updating dependencies afterwards"))
+		}
+
 		command := args[0]
 
 		args = append([]string{}, args[1:]...)
 
-		// Handles checking for subcommands which would change dependency files
-		update := strings.Contains(command, "install")
+		var update bool
+
+		if len(args) != 0 {
+			// Handles checking for a subcommand which would change dependency files;
+			// note, it only checks the first subcommand, ex. "install" in "pip install"
+			update, _ = regexp.Match(dependency.UpdateMatch, []byte(args[0]))
+		}
 
 		cmd := exec.Command(command, args...)
 
@@ -572,7 +586,7 @@ func main() {
 			buf := &bytes.Buffer{}
 			newDependencies := []string{}
 
-			cmd = exec.Command(command, dependency.UpdateDependencies...)
+			cmd = exec.Command(dependency.UpdateDependencies[0], dependency.UpdateDependencies[1:]...)
 
 			cmd.Stdout = buf
 
@@ -596,7 +610,7 @@ func main() {
 
 			defer dependencyFile.Close()
 
-			if requirementsChanged(newDependencies, oldDependenciesMap[dependency.FileName]) {
+			if dependenciesChanged(newDependencies, oldDependenciesMap[dependency.FileName]) {
 				for _, newDependency := range newDependencies {
 					fmt.Fprintln(dependencyFile, newDependency)
 				}
