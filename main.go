@@ -97,7 +97,7 @@ func newNotifier(path string) (*notifier, error) {
 	return newNotifier, nil
 }
 
-func pushNewRequirementsToGit(username, password, updateMessage, filePath string) error {
+func pushNewRequirementsToGit(username, password, updateMessage string, filePaths []string) error {
 	repository, err := git.PlainOpen("./")
 
 	if err != nil {
@@ -110,13 +110,16 @@ func pushNewRequirementsToGit(username, password, updateMessage, filePath string
 		return err
 	}
 
-	absRequirementsPath, err := filepath.Abs(filePath)
+	for _, filePath := range filePaths {
 
-	if err != nil {
-		return err
+		absRequirementsPath, err := filepath.Abs(filePath)
+
+		if err != nil {
+			return err
+		}
+
+		workTree.Add(absRequirementsPath)
 	}
-
-	workTree.Add(absRequirementsPath)
 
 	workTree.Commit(updateMessage, &git.CommitOptions{
 		Author: &object.Signature{
@@ -136,7 +139,7 @@ func pushNewRequirementsToGit(username, password, updateMessage, filePath string
 	return err
 }
 
-func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.Duration, fileChecker func(string) bool, changeHandler func(string) error) error {
+func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.Duration, fileChecker func(string) bool, changeHandler func([]string) error) error {
 	// Clean the path to maintain a uniform format for later comparison
 	dependenciesPath = filepath.Clean(dependenciesPath)
 
@@ -146,17 +149,25 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 		panic(err)
 	}
 
-	// These is nessesary for combatting notifications which happen too
+	// These is necessary for combatting notifications which happen too
 	// frequently; makes so that the handler for the write notifications
 	// on the requirements file is only triggered every 2 minutes max
-	newNotificationChan := make(chan bool)
+	newNotificationChan := make(chan string)
 	waitingForNewNotifications := false
 	handlingLock := &sync.Mutex{}
 
-	waitForNewNotifications := func() {
+	waitForNewNotifications := func(newUpdateFile string) {
+		updateFilesMap := map[string]bool{
+			newUpdateFile: true,
+		}
+
 		for {
 			select {
-			case <-newNotificationChan:
+			case newUpdateFile = <-newNotificationChan:
+				if !updateFilesMap[newUpdateFile] {
+					updateFilesMap[newUpdateFile] = true
+				}
+
 				continue
 			// This resets to waiting for two minutes each iteration
 			// of the loop, thus we don't need to worry about adding
@@ -166,15 +177,20 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 
 				select {
 				// Make sure that a new notification did not occur
-				// in between the parent select case and the aquisition
+				// in between the parent select case and the acquisition
 				// of the lock
 				case <-newNotificationChan:
 					handlingLock.Unlock()
 
 					continue
 				default:
-					// NEED TO HANDLE MULTIPLE AND GET THE FILEPATH HERE SOMEHOW
-					err := changeHandler()
+					updateFilesList := make([]string, 0)
+
+					for updateFile := range updateFilesMap {
+						updateFilesList = append(updateFilesList, updateFile)
+					}
+
+					err := changeHandler(updateFilesList)
 
 					// Indicate that we are no longer listening
 					// for new notifications
@@ -210,17 +226,17 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 				// in the lock to prevent race conditions in the
 				// waitForNewNotifications goroutine
 				if !waitingForNewNotifications {
-					go waitForNewNotifications()
+					go waitForNewNotifications(event.Name)
 
 					// Indicate that we are already waiting for new
-					// notificatations
+					// notifications
 					waitingForNewNotifications = true
 				} else {
 					// Send inside of the lock, so that if the
 					// waitForNewNotifications goroutine tries
-					// to aquire the lock after the wait times
+					// to acquire the lock after the wait times
 					// out it will continue waiting
-					newNotificationChan <- true
+					newNotificationChan <- event.Name
 				}
 
 				handlingLock.Unlock()
@@ -229,7 +245,7 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 			if !ok {
 				dependenciesNotifier.attachNewNotifier()
 			} else if err != nil {
-				fmt.Fprintln(os.Stdout, "Error Occured: ", err)
+				fmt.Fprintln(os.Stdout, "Error Occurred: ", err)
 			}
 		}
 	}
@@ -286,25 +302,25 @@ func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []
 	nameMatcher := regexp.MustCompile(nameMatch)
 
 	for _, dependency := range oldDependencies {
-		name = nameMatcher.FindAllString(dependency, 1)
+		name = nameMatcher.FindStringSubmatch(dependency)
 
-		if len(name) != 1 {
+		if len(name) != 2 {
 			continue
 		}
 
-		dependency = name[0]
+		dependency = name[1]
 
 		oldDependenciesMap[dependency] = true
 	}
 
 	for _, dependency := range newDependencies {
-		name = nameMatcher.FindAllString(dependency, 1)
+		name = nameMatcher.FindStringSubmatch(dependency)
 
-		if len(name) != 1 {
+		if len(name) != 2 {
 			continue
 		}
 
-		dependency = name[0]
+		dependency = name[1]
 
 		if !oldDependenciesMap[dependency] {
 			addedDependencies = append(addedDependencies, dependency)
@@ -320,20 +336,20 @@ func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []
 	}
 
 	if len(addedDependencies) != 0 || len(removedDependencies) != 0 {
-		addedRequirementsString, removedRequirmentsString := "", ""
+		addedDependenciesString, removedDependenciesString := "", ""
 
 		if len(addedDependencies) != 0 {
-			addedRequirementsString = fmt.Sprintf(" Added %s.", strings.Join(addedDependencies, ", "))
+			addedDependenciesString = fmt.Sprintf(" Added %s.", strings.Join(addedDependencies, ", "))
 		}
 
 		if len(removedDependencies) != 0 {
-			removedRequirmentsString = fmt.Sprintf(" Removed %s.", strings.Join(removedDependencies, ", "))
+			removedDependenciesString = fmt.Sprintf(" Removed %s.", strings.Join(removedDependencies, ", "))
 		}
 
 		return fmt.Sprintf(
 			"Changed %%s:%s%s",
-			addedRequirementsString,
-			removedRequirmentsString,
+			addedDependenciesString,
+			removedDependenciesString,
 		)
 	}
 
@@ -342,78 +358,78 @@ func getUnversionedDependenciesChangeMessage(newDependencies, oldDependencies []
 
 func getVersionedDependenciesChangeMessage(newRequirements, oldRequirements []string, nameVersionMatch string) string {
 	name, version := "", ""
-	changedRequirements, addedRequirements, removedRequirments := []string{}, []string{}, []string{}
+	changedDependencies, addedDependencies, removedDependencies := []string{}, []string{}, []string{}
 	requirementSplit := []string{}
 	newRequirementsMap, oldRequirementsMap := make(map[string]string), make(map[string]string)
 
 	nameVersionMatcher := regexp.MustCompile(nameVersionMatch)
 
 	for _, oldRequirement := range oldRequirements {
-		requirementSplit = nameVersionMatcher.FindAllString(oldRequirement, 2)
+		requirementSplit = nameVersionMatcher.FindStringSubmatch(oldRequirement)
 
-		if len(requirementSplit) != 2 {
+		if len(requirementSplit) != 3 {
 			continue
 		}
 
-		name, version = requirementSplit[0], requirementSplit[1]
+		name, version = requirementSplit[1], requirementSplit[2]
 
 		oldRequirementsMap[name] = version
 	}
 
 	for _, newRequirement := range newRequirements {
-		requirementSplit = nameVersionMatcher.FindAllString(newRequirement, 2)
+		requirementSplit = nameVersionMatcher.FindStringSubmatch(newRequirement)
 
-		if len(requirementSplit) != 2 {
+		if len(requirementSplit) != 3 {
 			continue
 		}
 
-		name, version = requirementSplit[0], requirementSplit[1]
+		name, version = requirementSplit[1], requirementSplit[2]
 
 		newRequirementsMap[name] = version
 
 		if oldRequirementVersion, exists := oldRequirementsMap[name]; !exists {
-			addedRequirements = append(addedRequirements, name)
+			addedDependencies = append(addedDependencies, name)
 		} else if exists {
 			if oldRequirementVersion != version {
-				changedRequirements = append(changedRequirements, fmt.Sprintf("%s => %s", name, version))
+				changedDependencies = append(changedDependencies, fmt.Sprintf("%s => %s", name, version))
 			}
 		}
 	}
 
 	for _, oldRequirement := range oldRequirements {
-		requirementSplit = nameVersionMatcher.FindAllString(oldRequirement, 2)
+		requirementSplit = nameVersionMatcher.FindStringSubmatch(oldRequirement)
 
-		if len(requirementSplit) != 2 {
+		if len(requirementSplit) != 3 {
 			continue
 		}
 
-		name, version = requirementSplit[0], requirementSplit[1]
+		name, version = requirementSplit[1], requirementSplit[2]
 
 		if _, exists := newRequirementsMap[name]; !exists {
-			removedRequirments = append(removedRequirments, name)
+			removedDependencies = append(removedDependencies, name)
 		}
 	}
 
-	if len(addedRequirements) != 0 || len(changedRequirements) != 0 || len(removedRequirments) != 0 {
-		addedRequirementsString, changedRequirementsString, removedRequirmentsString := "", "", ""
+	if len(addedDependencies) != 0 || len(changedDependencies) != 0 || len(removedDependencies) != 0 {
+		addedDependenciesString, changedDependenciesString, removedDependenciesString := "", "", ""
 
-		if len(addedRequirements) != 0 {
-			addedRequirementsString = fmt.Sprintf(" Added %s.", strings.Join(addedRequirements, ", "))
+		if len(addedDependencies) != 0 {
+			addedDependenciesString = fmt.Sprintf(" Added %s.", strings.Join(addedDependencies, ", "))
 		}
 
-		if len(changedRequirements) != 0 {
-			changedRequirementsString = fmt.Sprintf(" Changed %s.", strings.Join(changedRequirements, ", "))
+		if len(changedDependencies) != 0 {
+			changedDependenciesString = fmt.Sprintf(" Changed %s.", strings.Join(changedDependencies, ", "))
 		}
 
-		if len(removedRequirments) != 0 {
-			removedRequirmentsString = fmt.Sprintf(" Removed %s.", strings.Join(removedRequirments, ", "))
+		if len(removedDependencies) != 0 {
+			removedDependenciesString = fmt.Sprintf(" Removed %s.", strings.Join(removedDependencies, ", "))
 		}
 
 		return fmt.Sprintf(
 			"Changed %%s:%s%s%s",
-			addedRequirementsString,
-			changedRequirementsString,
-			removedRequirmentsString,
+			addedDependenciesString,
+			changedDependenciesString,
+			removedDependenciesString,
 		)
 	}
 
@@ -432,11 +448,10 @@ func main() {
 		}
 	}
 
-	handleRequirements := flag.Bool("hr", false, "Handle when a dependency file changes; cannot be used in conjuction with anything other than '-cp', -rp', and '-w'")
-	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("PIPR_CONFIG"))), "The path to the json config file with the github credentials that should be used")
-	// NEED TO CHANGE PIPR_REQUIREMENTS to PIPR_DEPENDENCIES, and rp to dp
-	requirementsPath := flag.String("dp", filepath.Clean(resolvePath("./requirements.txt")(os.LookupEnv("PIPR_DEPENDENCIES"))), "The path to the dependencies directory that should be watched or updated")
-	requirementsWaitPeriod := flag.Duration("w", 2*time.Minute, "How long pipr should wait after each change to the requirements.txt file before pushing the changes to github")
+	handleRequirements := flag.Bool("hr", false, "Handle when a dependency file changes; cannot be used in conjunction with anything other than '-cp', -rp', and '-w'")
+	configPath := flag.String("cp", filepath.Clean(resolvePath("./config.json")(os.LookupEnv("RJIN_CONFIG"))), "The path to the json config file with the github credentials that should be used")
+	dependenciesPath := flag.String("dp", filepath.Clean(resolvePath("./dependencies/")(os.LookupEnv("RJIN_DEPENDENCIES"))), "The path to the dependencies directory that should be watched or updated")
+	requirementsWaitPeriod := flag.Duration("w", 2*time.Minute, "How long rjin should wait after each change to the requirements.txt file before pushing the changes to github")
 
 	flag.Parse()
 
@@ -465,7 +480,7 @@ func main() {
 	oldDependenciesMap := make(map[string][]string)
 
 	for _, dependency := range config.Dependencies {
-		oldDependenciesMap[dependency.FileName], err = getDependenciesListFromPath(filepath.Join(*requirementsPath, dependency.FileName))
+		oldDependenciesMap[dependency.FileName], err = getDependenciesListFromPath(filepath.Join(*dependenciesPath, dependency.FileName))
 
 		if err != nil {
 			panic(fmt.Errorf("failed to get existing dependencies for %s file", dependency.FileName))
@@ -482,53 +497,58 @@ func main() {
 			return exists
 		}
 
-		dependencyChangeHandler := func(filePath string) error {
-			dependency := fileToDependenciesMap[filepath.Base(filePath)]
-			newDependencies, err := getDependenciesListFromPath(filePath)
-
-			if err != nil {
-				return err
-			}
-
+		dependencyChangeHandler := func(filePaths []string) error {
 			var commitMessage string
+			commitFiles, commitMessages := []string{}, []string{}
 
-			if dependency.Versioned {
-				commitMessage = getVersionedDependenciesChangeMessage(
-					newDependencies,
-					oldDependenciesMap[filepath.Base(filePath)],
-					dependency.LineMatch,
-				)
-			} else {
-				commitMessage = getUnversionedDependenciesChangeMessage(
-					newDependencies,
-					oldDependenciesMap[filepath.Base(filePath)],
-					dependency.LineMatch,
-				)
+			for _, filePath := range filePaths {
+				dependency := fileToDependenciesMap[filepath.Base(filePath)]
+				newDependencies, err := getDependenciesListFromPath(filePath)
+
+				if err != nil {
+					return err
+				}
+
+				if dependency.Versioned {
+					commitMessage = getVersionedDependenciesChangeMessage(
+						newDependencies,
+						oldDependenciesMap[filepath.Base(filePath)],
+						dependency.LineMatch,
+					)
+				} else {
+					commitMessage = getUnversionedDependenciesChangeMessage(
+						newDependencies,
+						oldDependenciesMap[filepath.Base(filePath)],
+						dependency.LineMatch,
+					)
+				}
+
+				if commitMessage != "" {
+					oldDependenciesMap[filepath.Base(filePath)] = newDependencies
+
+					commitMessages = append(commitMessages, fmt.Sprintf(commitMessage, filepath.Base(filePath)))
+					commitFiles = append(commitFiles, filepath.Join(*dependenciesPath, dependency.FileName))
+				}
 			}
 
-			if commitMessage != "" {
-				fmt.Println(commitMessage)
-
-				commitMessage = fmt.Sprintf(commitMessage, filepath.Base(filePath))
-
-				oldDependenciesMap[filepath.Base(filePath)] = newDependencies
-
+			if len(commitMessages) != 0 {
 				return pushNewRequirementsToGit(
 					config.Username,
 					config.Password,
-					commitMessage,
-					filepath.Join(*requirementsPath, dependency.FileName),
+					strings.Join(commitMessages, " "),
+					commitFiles,
 				)
 			}
 
 			return nil
 		}
 
-		err = handleWatchAndNotifyRequirements(*requirementsPath, *requirementsWaitPeriod, fileChecker, dependencyChangeHandler)
+		err = handleWatchAndNotifyRequirements(*dependenciesPath, *requirementsWaitPeriod, fileChecker, dependencyChangeHandler)
 
 		if err != nil {
 			panic(err)
 		}
+
 	} else {
 		// Default behavior is to read the requirements file as a list of strings,
 		// then pass the arguments as is into pip and run it the command, and if the
@@ -538,7 +558,7 @@ func main() {
 		// anything has changed
 		args := []string{}
 
-		// Filter out the dependecies directory path arg and the path itself
+		// Filter out the dependencies directory path arg and the path itself
 		for index := 1; index < len(os.Args); index++ {
 			if os.Args[index] == "-dp" {
 				index++
@@ -602,7 +622,7 @@ func main() {
 				panic(err)
 			}
 
-			dependencyFile, err := os.OpenFile(filepath.Join(*requirementsPath, dependency.FileName), os.O_WRONLY, 0444)
+			dependencyFile, err := os.OpenFile(filepath.Join(*dependenciesPath, dependency.FileName), os.O_WRONLY, 0444)
 
 			if err != nil {
 				panic(err)
