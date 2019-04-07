@@ -22,14 +22,11 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 )
 
-var (
-	requirementsChangeHandler func() error
-)
-
 type Config struct {
 	Username     string        `json:"username"`
 	Password     string        `json:"password"`
 	Dependencies []*Dependency `json:"dependencies"`
+	UpdateFiles  []string      `json:"updateFile"`
 }
 
 type Dependency struct {
@@ -41,30 +38,9 @@ type Dependency struct {
 	Versioned          bool     `json:"versioned"`
 }
 
-// type Config struct {
-// 	Username string                    `json:"username"`
-// 	Password string                    `json:"password"`
-// 	Parsers  map[string]DependencyFile `json:"parsers"`
-// }
-
-// type DependencyFile struct {
-// 	Command   Command `json:"command"`
-// 	LineMatch string  `json:"line-match"`
-// }
-
-// type Command struct {
-// 	Name        string `json:"name"`
-// 	UpdateMatch string `json:"update-match"`
-// }
-
-// type requirementChangeMetadata struct {
-// 	new                          bool
-// 	name, newVersion, oldVersion string
-// }
-
 type notifier struct {
 	*fsnotify.Watcher
-	path string
+	paths []string
 }
 
 func (n *notifier) attachNewNotifier() error {
@@ -74,10 +50,12 @@ func (n *notifier) attachNewNotifier() error {
 		return err
 	}
 
-	err = requirementWatcher.Add(n.path)
+	for _, path := range n.paths {
+		err = requirementWatcher.Add(path)
 
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
 	}
 
 	n.Watcher = requirementWatcher
@@ -85,8 +63,8 @@ func (n *notifier) attachNewNotifier() error {
 	return nil
 }
 
-func newNotifier(path string) (*notifier, error) {
-	newNotifier := &notifier{path: path}
+func newNotifier(paths []string) (*notifier, error) {
+	newNotifier := &notifier{paths: paths}
 
 	err := newNotifier.attachNewNotifier()
 
@@ -97,7 +75,7 @@ func newNotifier(path string) (*notifier, error) {
 	return newNotifier, nil
 }
 
-func pushNewRequirementsToGit(username, password, updateMessage string, filePaths []string) error {
+func pushNewChangesToGit(username, password, updateMessage string, filePaths []string) error {
 	repository, err := git.PlainOpen("./")
 
 	if err != nil {
@@ -139,11 +117,15 @@ func pushNewRequirementsToGit(username, password, updateMessage string, filePath
 	return err
 }
 
-func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.Duration, fileChecker func(string) bool, changeHandler func([]string) error) error {
-	// Clean the path to maintain a uniform format for later comparison
-	dependenciesPath = filepath.Clean(dependenciesPath)
+func handleWatchAndNotifyRequirements(watchFilePaths []string, waitPeriod time.Duration, fileChecker func(string) bool, changeHandler func([]string) error) error {
+	// Clean the paths to maintain a uniform format for later comparison
+	watchFilePathsClean := []string{}
 
-	dependenciesNotifier, err := newNotifier(dependenciesPath)
+	for _, extraWatchPath := range watchFilePaths {
+		watchFilePathsClean = append(watchFilePathsClean, filepath.Clean(extraWatchPath))
+	}
+
+	dependenciesNotifier, err := newNotifier(watchFilePathsClean)
 
 	if err != nil {
 		panic(err)
@@ -151,7 +133,7 @@ func handleWatchAndNotifyRequirements(dependenciesPath string, waitPeriod time.D
 
 	// These is necessary for combatting notifications which happen too
 	// frequently; makes so that the handler for the write notifications
-	// on the requirements file is only triggered every 2 minutes max
+	// on the requirements file is only triggered every {waitPeriod} max
 	newNotificationChan := make(chan string)
 	waitingForNewNotifications := false
 	handlingLock := &sync.Mutex{}
@@ -491,48 +473,76 @@ func main() {
 	}
 
 	if *handleRequirements {
-		fileChecker := func(filePath string) bool {
-			_, exists := oldDependenciesMap[filepath.Base(filePath)]
+		dependencyFileChecker := func(filePath string) bool {
+			fileBase := filepath.Base(filePath)
+
+			_, exists := oldDependenciesMap[fileBase]
+
+			if !exists {
+				for _, updateFile := range config.UpdateFiles {
+					if filepath.Base(updateFile) == fileBase {
+						return true
+					}
+				}
+			}
 
 			return exists
 		}
 
-		dependencyChangeHandler := func(filePaths []string) error {
+		watchFileChangeHandler := func(filePaths []string) error {
 			var commitMessage string
 			commitFiles, commitMessages := []string{}, []string{}
 
 			for _, filePath := range filePaths {
-				dependency := fileToDependenciesMap[filepath.Base(filePath)]
-				newDependencies, err := getDependenciesListFromPath(filePath)
+				dependency, exists := fileToDependenciesMap[filepath.Base(filePath)]
 
-				if err != nil {
-					return err
-				}
+				if exists {
+					newDependencies, err := getDependenciesListFromPath(filePath)
 
-				if dependency.Versioned {
-					commitMessage = getVersionedDependenciesChangeMessage(
-						newDependencies,
-						oldDependenciesMap[filepath.Base(filePath)],
-						dependency.LineMatch,
-					)
+					if err != nil {
+						return err
+					}
+
+					if dependency.Versioned {
+						commitMessage = getVersionedDependenciesChangeMessage(
+							newDependencies,
+							oldDependenciesMap[filepath.Base(filePath)],
+							dependency.LineMatch,
+						)
+					} else {
+						commitMessage = getUnversionedDependenciesChangeMessage(
+							newDependencies,
+							oldDependenciesMap[filepath.Base(filePath)],
+							dependency.LineMatch,
+						)
+					}
+
+					if commitMessage != "" {
+						oldDependenciesMap[filepath.Base(filePath)] = newDependencies
+
+						commitMessages = append(commitMessages, fmt.Sprintf(commitMessage, filepath.Base(filePath)))
+						commitFiles = append(commitFiles, filepath.Join(*dependenciesPath, dependency.FileName))
+
+						fmt.Printf("Dependency %s updated\n", filepath.Base(filePath))
+					}
 				} else {
-					commitMessage = getUnversionedDependenciesChangeMessage(
-						newDependencies,
-						oldDependenciesMap[filepath.Base(filePath)],
-						dependency.LineMatch,
-					)
-				}
+					// Handles when non-dependency files are changed
+					commitMessages = append(commitMessages, fmt.Sprintf("%s changed.", filepath.Base(filePath)))
 
-				if commitMessage != "" {
-					oldDependenciesMap[filepath.Base(filePath)] = newDependencies
+					absFilePath, err := filepath.Abs(filepath.Clean(filePath))
 
-					commitMessages = append(commitMessages, fmt.Sprintf(commitMessage, filepath.Base(filePath)))
-					commitFiles = append(commitFiles, filepath.Join(*dependenciesPath, dependency.FileName))
+					if err != nil {
+						return err
+					}
+
+					commitFiles = append(commitFiles, absFilePath)
+
+					fmt.Printf("Non-Dependency %s updated\n", filepath.Base(filePath))
 				}
 			}
 
 			if len(commitMessages) != 0 {
-				return pushNewRequirementsToGit(
+				return pushNewChangesToGit(
 					config.Username,
 					config.Password,
 					strings.Join(commitMessages, " "),
@@ -543,12 +553,13 @@ func main() {
 			return nil
 		}
 
-		err = handleWatchAndNotifyRequirements(*dependenciesPath, *requirementsWaitPeriod, fileChecker, dependencyChangeHandler)
+		config.UpdateFiles = append(config.UpdateFiles, *dependenciesPath)
+
+		err = handleWatchAndNotifyRequirements(config.UpdateFiles, *requirementsWaitPeriod, dependencyFileChecker, watchFileChangeHandler)
 
 		if err != nil {
 			panic(err)
 		}
-
 	} else {
 		// Default behavior is to read the requirements file as a list of strings,
 		// then pass the arguments as is into pip and run it the command, and if the
